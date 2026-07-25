@@ -195,11 +195,25 @@ kprobe:cap_capable
 /@tracked[pid]/
 {
   @cap_used[arg2] = count();
+    @cap_req[tid] = arg2;
+}
+kretprobe:cap_capable
+/@tracked[pid] && @cap_req[tid]/
+{
+    \$cap = @cap_req[tid];
+    if (retval == 0) {
+        @cap_ok[\$cap] = count();
+    } else {
+        @cap_denied[\$cap] = count();
+    }
+    delete(@cap_req[tid]);
 }
 interval:s:${RUNTIME}
 {
   print(@syscall_id);
   print(@cap_used);
+    print(@cap_ok);
+    print(@cap_denied);
   clear(@tracked);
   exit();
 }

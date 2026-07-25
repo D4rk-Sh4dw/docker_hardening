@@ -183,18 +183,23 @@ def build_syscall_map() -> dict[int, str]:
 # PARSERS
 # ================================================================
 
-def parse_trace(raw_file: Path, syscall_map: dict[int, str]) -> tuple[list[str], list[str], list[int]]:
+def parse_trace(
+    raw_file: Path,
+    syscall_map: dict[int, str],
+) -> tuple[list[str], list[str], list[int], dict[str, int], dict[str, int]]:
     """
     Parse combined bpftrace output containing @syscall_id and @cap_used maps.
     Returns (syscall_names, capability_names) - the actually observed ones.
     """
     if not raw_file.exists() or raw_file.stat().st_size == 0:
         print("  [!] trace-raw.txt is empty or missing")
-        return [], [], []
+        return [], [], [], {}, {}
 
     syscalls: set[str] = set()
     caps_used: set[str] = set()
     unknown_syscall_ids: set[int] = set()
+    caps_ok: dict[str, int] = {}
+    caps_denied: dict[str, int] = {}
 
     content = raw_file.read_text(errors="replace")
 
@@ -211,12 +216,22 @@ def parse_trace(raw_file: Path, syscall_map: dict[int, str]) -> tuple[list[str],
         if 0 <= cap_num < len(CAPABILITIES):
             caps_used.add(CAPABILITIES[cap_num])
 
+    for m in re.finditer(r'@cap_ok\[(\d+)\]:\s*(\d+)', content):
+        cap_num = int(m.group(1))
+        if 0 <= cap_num < len(CAPABILITIES):
+            caps_ok[CAPABILITIES[cap_num]] = int(m.group(2))
+
+    for m in re.finditer(r'@cap_denied\[(\d+)\]:\s*(\d+)', content):
+        cap_num = int(m.group(1))
+        if 0 <= cap_num < len(CAPABILITIES):
+            caps_denied[CAPABILITIES[cap_num]] = int(m.group(2))
+
     if unknown_syscall_ids:
         print(f"  [!] {len(unknown_syscall_ids)} unknown syscall IDs "
               f"(install `auditd` for full mapping): "
               f"{sorted(unknown_syscall_ids)[:10]}...")
 
-    return sorted(syscalls), sorted(caps_used), sorted(unknown_syscall_ids)
+    return sorted(syscalls), sorted(caps_used), sorted(unknown_syscall_ids), caps_ok, caps_denied
 
 
 def parse_granted_caps(cap_file: Path) -> list[str]:
@@ -258,11 +273,11 @@ def build_seccomp_profile(syscalls: list[str]) -> dict:
     }
 
 
-def build_compose_snippet(caps_used: list[str], seccomp_path: str) -> str:
+def build_compose_snippet(caps_required: list[str], seccomp_path: str) -> str:
     """Build docker-compose security_opt / cap_drop / cap_add snippet."""
     extra_caps = sorted(
         c.replace("CAP_", "")
-        for c in caps_used
+        for c in caps_required
         if c not in DOCKER_DEFAULT_CAPS
     )
 
@@ -293,11 +308,14 @@ def build_report(
     runtime: int,
     syscalls: list[str],
     caps_used: list[str],
+    caps_required: list[str],
+    caps_ok: dict[str, int],
+    caps_denied: dict[str, int],
     caps_granted: list[str],
     timestamp: str,
 ) -> str:
     """Build a human-readable Markdown report."""
-    extra_caps = [c for c in caps_used if c not in DOCKER_DEFAULT_CAPS]
+    extra_caps = [c for c in caps_required if c not in DOCKER_DEFAULT_CAPS]
     service_name = image.split("/")[-1].split(":")[0]
 
     lines = [
@@ -309,7 +327,9 @@ def build_report(
         f"| **Analysis Date** | {timestamp} |",
         f"| **Tracing Duration** | {runtime}s |",
         f"| **Unique Syscalls Observed** | {len(syscalls)} |",
-        f"| **Capabilities USED (eBPF)** | {len(caps_used)} |",
+        f"| **Capabilities CHECKED (eBPF)** | {len(caps_used)} |",
+        f"| **Capabilities ALLOWED (kretprobe)** | {len(caps_ok)} |",
+        f"| **Capabilities DENIED (kretprobe)** | {len(caps_denied)} |",
         f"| **Capabilities GRANTED (ref.)** | {len(caps_granted)} |",
         f"| **Non-default caps to add** | {len(extra_caps)} |",
         "",
@@ -332,7 +352,7 @@ def build_report(
         "| `trace-raw.txt` | Raw bpftrace output (syscalls + caps used) |",
         "| `capabilities-granted-raw.txt` | Reference: what was granted |",
         "",
-        "## Capabilities Actually Used",
+        "## Capabilities Checked",
         "",
     ]
 
@@ -345,8 +365,29 @@ def build_report(
         ]
     else:
         for cap in sorted(caps_used):
-            marker = "non-default (needs cap_add)" if cap not in DOCKER_DEFAULT_CAPS else "docker default"
+            marker = "non-default (checked)" if cap not in DOCKER_DEFAULT_CAPS else "docker default (checked)"
             lines.append(f"- `{cap}` - {marker}")
+
+    lines += [
+        "",
+        "## Capability Check Outcomes",
+        "",
+        "Only capabilities with **allowed** checks are used for cap_add recommendations.",
+        "Denied checks are kept as signal for app probing or blocked code paths.",
+        "",
+    ]
+
+    if not caps_ok and not caps_denied:
+        lines.append("_No cap_capable outcome data captured (older trace format or no checks)._")
+    else:
+        if caps_ok:
+            lines.append("Allowed checks:")
+            for cap, cnt in sorted(caps_ok.items()):
+                lines.append(f"- `{cap}` - {cnt}")
+        if caps_denied:
+            lines.append("Denied checks:")
+            for cap, cnt in sorted(caps_denied.items()):
+                lines.append(f"- `{cap}` - {cnt}")
 
     lines += [
         "",
@@ -397,12 +438,15 @@ def build_merge_report(
     source_reports: list[Path],
     syscalls: list[str],
     caps_used: list[str],
+    caps_required: list[str],
+    caps_ok: dict[str, int],
+    caps_denied: dict[str, int],
     caps_granted: list[str],
     unknown_syscall_ids: list[int],
     timestamp: str,
 ) -> str:
     """Build a report for merged analysis runs."""
-    extra_caps = [c for c in caps_used if c not in DOCKER_DEFAULT_CAPS]
+    extra_caps = [c for c in caps_required if c not in DOCKER_DEFAULT_CAPS]
     service_name = image.split("/")[-1].split(":")[0]
 
     lines = [
@@ -414,7 +458,9 @@ def build_merge_report(
         f"| **Merge Date** | {timestamp} |",
         f"| **Source Reports** | {len(source_reports)} |",
         f"| **Unique Syscalls Observed (Union)** | {len(syscalls)} |",
-        f"| **Capabilities USED (Union)** | {len(caps_used)} |",
+        f"| **Capabilities CHECKED (Union)** | {len(caps_used)} |",
+        f"| **Capabilities ALLOWED (Union)** | {len(caps_ok)} |",
+        f"| **Capabilities DENIED (Union)** | {len(caps_denied)} |",
         f"| **Capabilities GRANTED (Union, ref.)** | {len(caps_granted)} |",
         f"| **Unknown Syscall IDs (Union)** | {len(unknown_syscall_ids)} |",
         f"| **Non-default caps to add** | {len(extra_caps)} |",
@@ -501,9 +547,17 @@ def generate_single_report(report_dir: Path, image: str, runtime: int) -> None:
     print(f"  [+] Loaded {len(syscall_map)} syscall entries")
 
     print("  [*] Parsing trace data...")
-    syscalls, caps_used, unknown_syscall_ids = parse_trace(report_dir / "trace-raw.txt", syscall_map)
+    syscalls, caps_used, unknown_syscall_ids, caps_ok, caps_denied = parse_trace(
+        report_dir / "trace-raw.txt", syscall_map
+    )
     print(f"  [+] {len(syscalls)} unique syscalls observed")
-    print(f"  [+] {len(caps_used)} capabilities actually used")
+    print(f"  [+] {len(caps_used)} capabilities checked")
+    print(f"  [+] {len(caps_ok)} capabilities with allowed checks")
+    print(f"  [+] {len(caps_denied)} capabilities with denied checks")
+
+    # Strict mode by default: only capabilities with successful checks are
+    # considered required. Denied checks are informative, not recommendations.
+    caps_required = sorted(caps_ok.keys())
 
     if unknown_syscall_ids:
         unknown_file = report_dir / "unknown-syscall-ids.txt"
@@ -520,11 +574,21 @@ def generate_single_report(report_dir: Path, image: str, runtime: int) -> None:
     total = len(profile["syscalls"][0]["names"])
     print(f"  [+] seccomp.json - {total} syscalls allowed")
 
-    snippet = build_compose_snippet(caps_used, "./seccomp.json")
+    snippet = build_compose_snippet(caps_required, "./seccomp.json")
     (report_dir / "docker-compose-snippet.yml").write_text(snippet)
     print("  [+] docker-compose-snippet.yml written")
 
-    report = build_report(image, runtime, syscalls, caps_used, caps_granted, timestamp)
+    report = build_report(
+        image,
+        runtime,
+        syscalls,
+        caps_used,
+        caps_required,
+        caps_ok,
+        caps_denied,
+        caps_granted,
+        timestamp,
+    )
     (report_dir / "report.md").write_text(report)
     print("  [+] report.md written")
 
@@ -539,6 +603,9 @@ def merge_reports(output_dir: Path, image: str, report_dirs: list[Path]) -> None
 
     merged_syscalls: set[str] = set()
     merged_caps_used: set[str] = set()
+    merged_caps_required: set[str] = set()
+    merged_caps_ok: dict[str, int] = {}
+    merged_caps_denied: dict[str, int] = {}
     merged_caps_granted: set[str] = set()
     merged_unknown_ids: set[int] = set()
     existing_sources: list[Path] = []
@@ -552,12 +619,19 @@ def merge_reports(output_dir: Path, image: str, report_dirs: list[Path]) -> None
         existing_sources.append(report_dir)
         print(f"  [*] Merging {report_dir}")
 
-        syscalls, caps_used, unknown_ids = parse_trace(trace_file, syscall_map)
+        syscalls, caps_used, unknown_ids, caps_ok, caps_denied = parse_trace(trace_file, syscall_map)
         merged_syscalls.update(syscalls)
         merged_caps_used.update(caps_used)
         merged_unknown_ids.update(unknown_ids)
 
+        for cap, cnt in caps_ok.items():
+            merged_caps_ok[cap] = merged_caps_ok.get(cap, 0) + cnt
+        for cap, cnt in caps_denied.items():
+            merged_caps_denied[cap] = merged_caps_denied.get(cap, 0) + cnt
+
         merged_caps_granted.update(parse_granted_caps(report_dir / "capabilities-granted-raw.txt"))
+
+    merged_caps_required.update(merged_caps_ok.keys())
 
     if not existing_sources:
         print("  [-] No valid report directories to merge")
@@ -565,6 +639,7 @@ def merge_reports(output_dir: Path, image: str, report_dirs: list[Path]) -> None
 
     syscalls_sorted = sorted(merged_syscalls)
     caps_used_sorted = sorted(merged_caps_used)
+    caps_required_sorted = sorted(merged_caps_required)
     caps_granted_sorted = sorted(merged_caps_granted)
     unknown_sorted = sorted(merged_unknown_ids)
 
@@ -572,7 +647,7 @@ def merge_reports(output_dir: Path, image: str, report_dirs: list[Path]) -> None
     (output_dir / "seccomp.json").write_text(json.dumps(profile, indent=2))
     print(f"  [+] seccomp.json written ({len(profile['syscalls'][0]['names'])} syscalls allowed)")
 
-    snippet = build_compose_snippet(caps_used_sorted, "./seccomp.json")
+    snippet = build_compose_snippet(caps_required_sorted, "./seccomp.json")
     (output_dir / "docker-compose-snippet.yml").write_text(snippet)
     print("  [+] docker-compose-snippet.yml written")
 
@@ -581,6 +656,9 @@ def merge_reports(output_dir: Path, image: str, report_dirs: list[Path]) -> None
         source_reports=existing_sources,
         syscalls=syscalls_sorted,
         caps_used=caps_used_sorted,
+        caps_required=caps_required_sorted,
+        caps_ok=merged_caps_ok,
+        caps_denied=merged_caps_denied,
         caps_granted=caps_granted_sorted,
         unknown_syscall_ids=unknown_sorted,
         timestamp=timestamp,
