@@ -43,6 +43,29 @@ log_error() { echo -e "${RED}[-]${NC} $*" >&2; }
 
 TRACER_PID=""
 
+collect_descendant_pids() {
+    local root_pid="$1"
+    local -a queue=("$root_pid")
+    local -a out=()
+    local pid child
+    declare -A seen=()
+
+    while [ ${#queue[@]} -gt 0 ]; do
+        pid="${queue[0]}"
+        queue=("${queue[@]:1}")
+
+        [ -n "${seen[$pid]:-}" ] && continue
+        seen[$pid]=1
+        out+=("$pid")
+
+        while IFS= read -r child; do
+            [ -n "$child" ] && queue+=("$child")
+        done < <(pgrep -P "$pid" 2>/dev/null || true)
+    done
+
+    echo "${out[*]}"
+}
+
 cleanup() {
     [ -n "$TRACER_PID" ] && kill "$TRACER_PID" 2>/dev/null || true
 }
@@ -66,6 +89,16 @@ install_deps() {
         elif command -v yum     &>/dev/null; then yum install -y -q "${pkgs[@]}"
         else log_error "No supported package manager found."; exit 1; fi
     fi
+
+    # Best-effort: improves syscall ID -> name mapping in generator.py.
+    if ! command -v ausyscall &>/dev/null; then
+        log_warn "ausyscall not found, trying to install audit tooling"
+        if   command -v apt-get &>/dev/null; then apt-get install -y -qq auditd || true
+        elif command -v dnf     &>/dev/null; then dnf install -y -q audit || true
+        elif command -v yum     &>/dev/null; then yum install -y -q audit || true
+        fi
+    fi
+    command -v ausyscall &>/dev/null || log_warn "ausyscall still missing - unknown syscall IDs may remain"
 
     if ! bpftrace -l 'tracepoint:syscalls:sys_enter_read' &>/dev/null; then
         log_error "bpftrace cannot access syscall tracepoints."
@@ -126,11 +159,11 @@ start_tracer() {
 
     log_info "eBPF filter: PID subtree of $ROOT_PID (all container procs + future forks)"
 
-    # Seed the tracked map with ALL existing container PIDs, not just the root.
-    # Docker-compose containers often have many long-running child processes.
+    # Seed with the full current descendant tree, not only direct children.
+    # This closes gaps for already-running worker processes.
     local seed_pids
-    seed_pids=$(pgrep -P "$ROOT_PID" 2>/dev/null || true)
-    seed_pids="$ROOT_PID $seed_pids"
+    seed_pids=$(collect_descendant_pids "$ROOT_PID")
+    seed_pids="${seed_pids:-$ROOT_PID}"
 
     # Build BPF BEGIN block with all seed PIDs
     local begin_block="BEGIN {"

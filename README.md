@@ -38,6 +38,31 @@ sudo ./analyze.sh myapp:1.0 120 -- -p 8080:80 -e APP_ENV=prod
 sudo ./analyze.sh postgres:16 300 -- -e POSTGRES_PASSWORD=test
 ```
 
+### Merge multiple runs into one profile
+
+When you trace different workloads (startup, uploads, background jobs), merge
+their reports to build a safer union profile:
+
+```bash
+python3 generator.py merge \
+  reports/immich_merged_20260725 \
+  ghcr.io/immich-app/immich-server:release \
+  reports/attach_immich-server_1_20260725_101500 \
+  reports/attach_immich-server_1_20260725_104200 \
+  reports/attach_immich-server_1_20260725_110900
+```
+
+Merged output:
+
+```
+reports/immich_merged_20260725/
+├── seccomp.json
+├── docker-compose-snippet.yml
+├── report.md
+├── merged-sources.txt
+└── unknown-syscall-ids.txt (optional)
+```
+
 Arguments:
 - `<image>` — Docker image to analyze
 - `<runtime_seconds>` — how long to trace

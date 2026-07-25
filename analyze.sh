@@ -48,6 +48,29 @@ CONTAINER_ID=""
 TRACER_PID=""
 ROOT_PID=""
 
+collect_descendant_pids() {
+    local root_pid="$1"
+    local -a queue=("$root_pid")
+    local -a out=()
+    local pid child
+    declare -A seen=()
+
+    while [ ${#queue[@]} -gt 0 ]; do
+        pid="${queue[0]}"
+        queue=("${queue[@]:1}")
+
+        [ -n "${seen[$pid]:-}" ] && continue
+        seen[$pid]=1
+        out+=("$pid")
+
+        while IFS= read -r child; do
+            [ -n "$child" ] && queue+=("$child")
+        done < <(pgrep -P "$pid" 2>/dev/null || true)
+    done
+
+    echo "${out[*]}"
+}
+
 cleanup() {
     [ -n "$TRACER_PID" ] && kill "$TRACER_PID" 2>/dev/null || true
     if [ -n "$CONTAINER_ID" ]; then
@@ -78,6 +101,16 @@ install_deps() {
         else log_error "No supported package manager found. Install manually: ${pkgs[*]}"; exit 1; fi
     fi
 
+    # Best-effort: improves syscall ID -> name mapping in generator.py.
+    if ! command -v ausyscall &>/dev/null; then
+        log_warn "ausyscall not found, trying to install audit tooling"
+        if   command -v apt-get &>/dev/null; then apt-get install -y -qq auditd || true
+        elif command -v dnf     &>/dev/null; then dnf install -y -q audit || true
+        elif command -v yum     &>/dev/null; then yum install -y -q audit || true
+        fi
+    fi
+    command -v ausyscall &>/dev/null || log_warn "ausyscall still missing - unknown syscall IDs may remain"
+
     # Verify bpftrace can access syscall tracepoints
     if ! bpftrace -l 'tracepoint:syscalls:sys_enter_read' &>/dev/null; then
         log_error "bpftrace cannot access syscall tracepoints. Check kernel config (CONFIG_FTRACE_SYSCALLS)."
@@ -103,7 +136,6 @@ start_container() {
         "$IMAGE")
 
     log_ok "Container: ${CONTAINER_ID:0:12}"
-    sleep 2  # let init process settle
 
     if ! docker ps -q --no-trunc 2>/dev/null | grep -q "^${CONTAINER_ID}$"; then
         log_error "Container exited immediately. Logs:"
@@ -125,16 +157,25 @@ start_tracer() {
     log_info "eBPF filter: PID subtree of container root PID ($ROOT_PID)"
 
     # Strategy:
-    #  - BEGIN: seed the tracked-PID map with the container root PID
+    #  - BEGIN: seed tracked PIDs with the full current descendant tree
     #  - sched_process_fork: propagate tracking to every child process
     #  - sched_process_exit: clean up (optional but keeps map small)
     #  - sys_enter_*: count syscalls for tracked PIDs
     #  - cap_capable: count capability checks for tracked PIDs (arg2 = cap num)
+    local seed_pids
+    seed_pids=$(collect_descendant_pids "$ROOT_PID")
+    seed_pids="${seed_pids:-$ROOT_PID}"
+
+    local begin_block="BEGIN {"
+    local pid
+    for pid in $seed_pids; do
+        begin_block+=" @tracked[${pid}] = 1;"
+    done
+    begin_block+=" }"
+
     local bpf_script
     bpf_script=$(cat <<BPF
-BEGIN {
-  @tracked[${ROOT_PID}] = 1;
-}
+${begin_block}
 tracepoint:sched:sched_process_fork
 /@tracked[args->parent_pid]/
 {
@@ -167,7 +208,7 @@ BPF
 
     bpftrace -e "$bpf_script" > "$raw_file" 2>&1 &
     TRACER_PID=$!
-    log_ok "eBPF tracer started (PID: $TRACER_PID)"
+    log_ok "eBPF tracer started (PID: $TRACER_PID, seeded with $(echo "$seed_pids" | wc -w) PIDs)"
 }
 
 # ================================================================

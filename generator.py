@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 generator.py - Parse eBPF trace output -> Docker security profiles
-Usage: python3 generator.py <report_dir> <image_name> [runtime_seconds]
+Usage:
+    python3 generator.py <report_dir> <image_name> [runtime_seconds]
+    python3 generator.py merge <output_dir> <image_name> <report_dir1> <report_dir2> [...]
 """
 
 import sys
@@ -64,6 +66,19 @@ CAPABILITIES = [
 ESSENTIAL_SYSCALLS = [
     "exit", "exit_group", "futex", "rt_sigreturn",
     "restart_syscall", "rt_sigaction", "rt_sigprocmask",
+]
+
+# Conservative baseline to avoid profiles that are too narrow when traces are
+# short or miss startup paths. The observed syscall set is still the primary
+# signal, this list only adds common runtime plumbing calls.
+BASELINE_SYSCALLS = [
+    "arch_prctl", "brk", "clock_getres", "clock_gettime", "close",
+    "epoll_create1", "epoll_ctl", "epoll_pwait", "fcntl", "fstat",
+    "futex", "getpid", "getrandom", "gettid", "ioctl", "lseek",
+    "madvise", "mmap", "mprotect", "munmap", "newfstatat", "openat",
+    "pread64", "prlimit64", "read", "rt_sigaction", "rt_sigprocmask",
+    "rt_sigreturn", "set_robust_list", "set_tid_address", "socket",
+    "statx", "write",
 ]
 
 # Docker's default capability set (no explicit cap_add needed for these)
@@ -168,14 +183,14 @@ def build_syscall_map() -> dict[int, str]:
 # PARSERS
 # ================================================================
 
-def parse_trace(raw_file: Path, syscall_map: dict[int, str]) -> tuple[list[str], list[str]]:
+def parse_trace(raw_file: Path, syscall_map: dict[int, str]) -> tuple[list[str], list[str], list[int]]:
     """
     Parse combined bpftrace output containing @syscall_id and @cap_used maps.
     Returns (syscall_names, capability_names) - the actually observed ones.
     """
     if not raw_file.exists() or raw_file.stat().st_size == 0:
         print("  [!] trace-raw.txt is empty or missing")
-        return [], []
+        return [], [], []
 
     syscalls: set[str] = set()
     caps_used: set[str] = set()
@@ -201,7 +216,7 @@ def parse_trace(raw_file: Path, syscall_map: dict[int, str]) -> tuple[list[str],
               f"(install `auditd` for full mapping): "
               f"{sorted(unknown_syscall_ids)[:10]}...")
 
-    return sorted(syscalls), sorted(caps_used)
+    return sorted(syscalls), sorted(caps_used), sorted(unknown_syscall_ids)
 
 
 def parse_granted_caps(cap_file: Path) -> list[str]:
@@ -225,7 +240,7 @@ def parse_granted_caps(cap_file: Path) -> list[str]:
 
 def build_seccomp_profile(syscalls: list[str]) -> dict:
     """Build an OCI-compatible seccomp allowlist profile."""
-    all_syscalls = sorted(set(syscalls) | set(ESSENTIAL_SYSCALLS))
+    all_syscalls = sorted(set(syscalls) | set(ESSENTIAL_SYSCALLS) | set(BASELINE_SYSCALLS))
     return {
         "defaultAction": "SCMP_ACT_ERRNO",
         "defaultErrnoRet": 1,
@@ -376,28 +391,125 @@ def build_report(
     lines.append("```")
     return "\n".join(lines) + "\n"
 
-# ================================================================
-# MAIN
-# ================================================================
 
-def main() -> None:
-    if len(sys.argv) < 3:
-        print("Usage: python3 generator.py <report_dir> <image_name> [runtime_seconds]")
-        sys.exit(1)
+def build_merge_report(
+    image: str,
+    source_reports: list[Path],
+    syscalls: list[str],
+    caps_used: list[str],
+    caps_granted: list[str],
+    unknown_syscall_ids: list[int],
+    timestamp: str,
+) -> str:
+    """Build a report for merged analysis runs."""
+    extra_caps = [c for c in caps_used if c not in DOCKER_DEFAULT_CAPS]
+    service_name = image.split("/")[-1].split(":")[0]
 
-    report_dir = Path(sys.argv[1])
-    image      = sys.argv[2]
-    runtime    = int(sys.argv[3]) if len(sys.argv) > 3 else 60
-    timestamp  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        "# Docker Security Analysis Report (Merged)",
+        "",
+        "| Field | Value |",
+        "|---|---|",
+        f"| **Image** | `{image}` |",
+        f"| **Merge Date** | {timestamp} |",
+        f"| **Source Reports** | {len(source_reports)} |",
+        f"| **Unique Syscalls Observed (Union)** | {len(syscalls)} |",
+        f"| **Capabilities USED (Union)** | {len(caps_used)} |",
+        f"| **Capabilities GRANTED (Union, ref.)** | {len(caps_granted)} |",
+        f"| **Unknown Syscall IDs (Union)** | {len(unknown_syscall_ids)} |",
+        f"| **Non-default caps to add** | {len(extra_caps)} |",
+        "",
+        "## Source Reports",
+        "",
+    ]
+
+    for p in source_reports:
+        lines.append(f"- `{p}`")
+
+    lines += [
+        "",
+        "## Capabilities Actually Used (Union)",
+        "",
+    ]
+
+    if not caps_used:
+        lines.append("_No capability checks recorded across all merged traces._")
+    else:
+        for cap in sorted(caps_used):
+            marker = "non-default (needs cap_add)" if cap not in DOCKER_DEFAULT_CAPS else "docker default"
+            lines.append(f"- `{cap}` - {marker}")
+
+    lines += [
+        "",
+        "## Syscalls (Union)",
+        "",
+        f"{len(syscalls)} unique syscalls observed across merged runs "
+        f"(+ {len(ESSENTIAL_SYSCALLS)} essential + baseline set):",
+        "",
+        "```",
+    ]
+    lines += sorted(syscalls) if syscalls else ["(none captured)"]
+    lines += [
+        "```",
+        "",
+    ]
+
+    if unknown_syscall_ids:
+        lines += [
+            "## Unknown Syscall IDs",
+            "",
+            "These IDs could not be mapped to names. Re-run with `ausyscall` available",
+            "for best accuracy.",
+            "",
+            "```",
+            "\n".join(str(i) for i in unknown_syscall_ids),
+            "```",
+            "",
+        ]
+
+    lines += [
+        "## Quick Start",
+        "",
+        "```yaml",
+        "services:",
+        f"  {service_name}:",
+        f"    image: {image}",
+        "    security_opt:",
+        "      - no-new-privileges:true",
+        "      - seccomp:./seccomp.json",
+        "    cap_drop:",
+        "      - ALL",
+    ]
+
+    if extra_caps:
+        lines.append("    cap_add:")
+        for cap in sorted(extra_caps):
+            lines.append(f"      - {cap.replace('CAP_', '')}")
+
+    lines += [
+        "```",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def generate_single_report(report_dir: Path, image: str, runtime: int) -> None:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     print("  [*] Building syscall ID -> name map...")
     syscall_map = build_syscall_map()
     print(f"  [+] Loaded {len(syscall_map)} syscall entries")
 
     print("  [*] Parsing trace data...")
-    syscalls, caps_used = parse_trace(report_dir / "trace-raw.txt", syscall_map)
+    syscalls, caps_used, unknown_syscall_ids = parse_trace(report_dir / "trace-raw.txt", syscall_map)
     print(f"  [+] {len(syscalls)} unique syscalls observed")
     print(f"  [+] {len(caps_used)} capabilities actually used")
+
+    if unknown_syscall_ids:
+        unknown_file = report_dir / "unknown-syscall-ids.txt"
+        unknown_file.write_text("\n".join(str(i) for i in unknown_syscall_ids) + "\n")
+        print(f"  [!] {len(unknown_syscall_ids)} unknown syscall IDs found (saved to {unknown_file.name})")
+        print("  [!] Install `auditd` (for `ausyscall`) and re-run for more accurate syscall naming")
 
     print("  [*] Reading granted-caps snapshot (reference)...")
     caps_granted = parse_granted_caps(report_dir / "capabilities-granted-raw.txt")
@@ -415,6 +527,104 @@ def main() -> None:
     report = build_report(image, runtime, syscalls, caps_used, caps_granted, timestamp)
     (report_dir / "report.md").write_text(report)
     print("  [+] report.md written")
+
+
+def merge_reports(output_dir: Path, image: str, report_dirs: list[Path]) -> None:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("  [*] Building syscall ID -> name map...")
+    syscall_map = build_syscall_map()
+    print(f"  [+] Loaded {len(syscall_map)} syscall entries")
+
+    merged_syscalls: set[str] = set()
+    merged_caps_used: set[str] = set()
+    merged_caps_granted: set[str] = set()
+    merged_unknown_ids: set[int] = set()
+    existing_sources: list[Path] = []
+
+    for report_dir in report_dirs:
+        trace_file = report_dir / "trace-raw.txt"
+        if not trace_file.exists():
+            print(f"  [!] Skipping {report_dir}: missing trace-raw.txt")
+            continue
+
+        existing_sources.append(report_dir)
+        print(f"  [*] Merging {report_dir}")
+
+        syscalls, caps_used, unknown_ids = parse_trace(trace_file, syscall_map)
+        merged_syscalls.update(syscalls)
+        merged_caps_used.update(caps_used)
+        merged_unknown_ids.update(unknown_ids)
+
+        merged_caps_granted.update(parse_granted_caps(report_dir / "capabilities-granted-raw.txt"))
+
+    if not existing_sources:
+        print("  [-] No valid report directories to merge")
+        sys.exit(1)
+
+    syscalls_sorted = sorted(merged_syscalls)
+    caps_used_sorted = sorted(merged_caps_used)
+    caps_granted_sorted = sorted(merged_caps_granted)
+    unknown_sorted = sorted(merged_unknown_ids)
+
+    profile = build_seccomp_profile(syscalls_sorted)
+    (output_dir / "seccomp.json").write_text(json.dumps(profile, indent=2))
+    print(f"  [+] seccomp.json written ({len(profile['syscalls'][0]['names'])} syscalls allowed)")
+
+    snippet = build_compose_snippet(caps_used_sorted, "./seccomp.json")
+    (output_dir / "docker-compose-snippet.yml").write_text(snippet)
+    print("  [+] docker-compose-snippet.yml written")
+
+    report = build_merge_report(
+        image=image,
+        source_reports=existing_sources,
+        syscalls=syscalls_sorted,
+        caps_used=caps_used_sorted,
+        caps_granted=caps_granted_sorted,
+        unknown_syscall_ids=unknown_sorted,
+        timestamp=timestamp,
+    )
+    (output_dir / "report.md").write_text(report)
+    print("  [+] report.md written")
+
+    (output_dir / "merged-sources.txt").write_text("\n".join(str(p) for p in existing_sources) + "\n")
+    print("  [+] merged-sources.txt written")
+
+    if unknown_sorted:
+        (output_dir / "unknown-syscall-ids.txt").write_text("\n".join(str(i) for i in unknown_sorted) + "\n")
+        print(f"  [!] unknown-syscall-ids.txt written ({len(unknown_sorted)} IDs)")
+
+# ================================================================
+# MAIN
+# ================================================================
+
+def main() -> None:
+    if len(sys.argv) < 2:
+        print("Usage:")
+        print("  python3 generator.py <report_dir> <image_name> [runtime_seconds]")
+        print("  python3 generator.py merge <output_dir> <image_name> <report_dir1> <report_dir2> [...]")
+        sys.exit(1)
+
+    if sys.argv[1] == "merge":
+        if len(sys.argv) < 6:
+            print("Usage: python3 generator.py merge <output_dir> <image_name> <report_dir1> <report_dir2> [...]")
+            sys.exit(1)
+
+        output_dir = Path(sys.argv[2])
+        image = sys.argv[3]
+        report_dirs = [Path(p) for p in sys.argv[4:]]
+        merge_reports(output_dir, image, report_dirs)
+        return
+
+    if len(sys.argv) < 3:
+        print("Usage: python3 generator.py <report_dir> <image_name> [runtime_seconds]")
+        sys.exit(1)
+
+    report_dir = Path(sys.argv[1])
+    image = sys.argv[2]
+    runtime = int(sys.argv[3]) if len(sys.argv) > 3 else 60
+    generate_single_report(report_dir, image, runtime)
 
 
 if __name__ == "__main__":
