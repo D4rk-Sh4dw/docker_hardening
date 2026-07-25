@@ -60,6 +60,8 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+ATTACH_SCRIPT="${SCRIPT_DIR}/attach.sh"
+GENERATOR_SCRIPT="${SCRIPT_DIR}/generator.py"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 log_info()  { echo -e "${BLUE}[*]${NC} $*"; }
@@ -73,6 +75,16 @@ MERGE_DIR="${SESSION_DIR}/merged"
 LOG_FILE="${SESSION_DIR}/watch.log"
 mkdir -p "$SESSION_DIR"
 touch "$RUNS_FILE" "$LOG_FILE"
+
+if [ ! -f "$ATTACH_SCRIPT" ]; then
+    log_error "attach.sh not found at: $ATTACH_SCRIPT"
+    exit 1
+fi
+
+if [ ! -f "$GENERATOR_SCRIPT" ]; then
+    log_error "generator.py not found at: $GENERATOR_SCRIPT"
+    exit 1
+fi
 
 if [ "$DETACH" -eq 1 ] && [ -z "${WATCH_DETACHED:-}" ]; then
     log_info "Starting detached watcher..."
@@ -114,7 +126,7 @@ refresh_merge() {
     local image_name
     image_name="$(resolve_image_name)"
 
-    python3 "${SCRIPT_DIR}/generator.py" merge "$MERGE_DIR" "$image_name" "${report_dirs[@]}" >> "$LOG_FILE" 2>&1 || {
+    python3 "$GENERATOR_SCRIPT" merge "$MERGE_DIR" "$image_name" "${report_dirs[@]}" >> "$LOG_FILE" 2>&1 || {
         log_warn "Merge refresh failed; will retry after next run"
         return 1
     }
@@ -131,7 +143,7 @@ while true; do
     wait_for_container_running
 
     log_info "Starting new trace run for '$CONTAINER'"
-    run_output="$(${SCRIPT_DIR}/attach.sh "$CONTAINER" "$RUNTIME" 2>&1 | tee -a "$LOG_FILE")" || {
+    run_output="$(bash "$ATTACH_SCRIPT" "$CONTAINER" "$RUNTIME" 2>&1 | tee -a "$LOG_FILE")" || {
         log_warn "attach.sh failed (container may have restarted); retrying"
         sleep "$RETRY_SECONDS"
         continue
