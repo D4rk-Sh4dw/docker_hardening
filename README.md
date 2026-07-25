@@ -38,6 +38,40 @@ sudo ./analyze.sh myapp:1.0 120 -- -p 8080:80 -e APP_ENV=prod
 sudo ./analyze.sh postgres:16 300 -- -e POSTGRES_PASSWORD=test
 ```
 
+### Keep tracing across restarts (watch mode)
+
+Use watch mode to continuously trace in windows, survive container restarts,
+and keep a merged profile updated automatically.
+
+```bash
+chmod +x watch.sh
+
+# Foreground loop
+sudo ./watch.sh immich-server 300
+
+# Detached (keeps running after SSH disconnect)
+sudo ./watch.sh immich-server 300 --detach
+```
+
+Watch mode output session:
+
+```
+reports/watch_<container>_<timestamp>/
+├── watch.log
+├── runs.txt
+└── merged/
+  ├── seccomp.json
+  ├── docker-compose-snippet.yml
+  ├── report.md
+  ├── merged-sources.txt
+  └── unknown-syscall-ids.txt (optional)
+```
+
+Notes:
+- If the container is down, watch mode waits and retries automatically.
+- If the container restarts, the next run starts automatically.
+- In `--detach` mode, the watcher is started with `nohup`.
+
 ### Merge multiple runs into one profile
 
 When you trace different workloads (startup, uploads, background jobs), merge
